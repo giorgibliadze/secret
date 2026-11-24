@@ -1,7 +1,8 @@
 import "server-only";
-import { mkdir, readFile, open, rename, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { JsonStorage, type JsonTransaction } from "./storage/transaction";
+import { FileJsonDriver, logStorageError } from "./storage/file";
+import { defaultStorage } from "./storage";
 import { drawRecipients } from "./draw";
 import { ACCOUNT_EMAILS, normalizeEmail, validMapping } from "./accounts";
 import { digest, newToken, validToken, validPassword, hashPassword, verifyPassword } from "./password";
@@ -17,10 +18,6 @@ export const SESSION_SECONDS = 30 * 24 * 60 * 60;
 const LOGIN_ERROR = "ელფოსტა ან პაროლი არასწორია";
 export const SETUP_SECONDS = 10 * 60;
 const PAIR_ERROR = "სახელი და ელფოსტა არ ემთხვევა";
-
-// Shared across service instances and module reloads within this Node.js process.
-const processState = globalThis as typeof globalThis & { santaFileQueues?: Map<string, Promise<void>> };
-const queues = processState.santaFileQueues ??= new Map<string, Promise<void>>();
 
 export class SantaError extends Error {
   constructor(public status: number, message: string) { super(message); }
@@ -56,48 +53,24 @@ function parseRound(raw: string): Round {
   return value;
 }
 export class SantaService {
-  private path: string;
-  constructor(path = join(process.cwd(), "data", "secret-santa.json")) { this.path = resolve(/* turbopackIgnore: true */ path); }
+  private storage: JsonStorage;
+  private transaction = new AsyncLocalStorage<JsonTransaction>();
+  constructor(storage?: string | JsonStorage) {
+    this.storage = typeof storage === "string" ? new JsonStorage(new FileJsonDriver(storage)) : storage ?? defaultStorage();
+  }
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = queues.get(this.path) ?? Promise.resolve();
-    const current = previous.then(operation);
-    const settled = current.then(() => {}, () => {});
-    queues.set(this.path, settled);
-    try { return await current; }
-    finally { if (queues.get(this.path) === settled) queues.delete(this.path); }
+    return this.storage.run(tx => this.transaction.run(tx, operation), error => error instanceof SantaError);
   }
   private async save(round: Round) {
-    try { await this.atomicSave(round); }
-    catch (error) { this.storageError("write", error); throw error; }
-  }
-  private async atomicSave(round: Round) {
-    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.path}.${randomUUID()}.tmp`;
-    try {
-      const file = await open(temporary, "wx", 0o600);
-      try { await file.writeFile(JSON.stringify(round, null, 2) + "\n", "utf8"); await file.sync(); }
-      finally { await file.close(); }
-      // Same directory/filesystem: readers see either the old complete file or the new complete file.
-      await rename(temporary, this.path);
-    } finally {
-      await unlink(temporary).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
-    }
-  }
-  private storageError(kind: "read" | "write" | "corrupt", error: unknown) {
-    // Never log the file contents, passwords, activation tokens, or raw error messages.
-    const rawCode = (error as NodeJS.ErrnoException)?.code;
-    const code = typeof rawCode === "string" && /^E[A-Z0-9_]+$/.test(rawCode) ? rawCode : undefined;
-    console.error("[secret-santa] storage error", { kind, ...(code ? { code } : {}) });
+    const tx = this.transaction.getStore();
+    if (!tx) throw new Error("Storage transaction required");
+    await tx.write(JSON.stringify(round, null, 2) + "\n");
   }
   private async load(): Promise<Round> {
-    let raw: string;
-    try { raw = await readFile(this.path, "utf8"); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        this.storageError("read", error);
-        throw error;
-      }
-      // All callers hold the same per-file queue. Only an actually missing file is initialized.
+    const tx = this.transaction.getStore();
+    if (!tx) throw new Error("Storage transaction required");
+    const raw = await tx.read();
+    if (raw === null) {
       const initial: Round = {
         version: 1, drawnAt: null, assignments: [],
         accounts: this.initialAccounts(), sessions: [], failures: {}, enrollments: [],
@@ -108,7 +81,7 @@ export class SantaService {
     // Existing account records are never reseeded; name-only legacy rounds gain accounts without changing their draw.
     let round: Round;
     try { round = parseRound(raw); }
-    catch (error) { this.storageError("corrupt", error); throw error; }
+    catch (error) { logStorageError("corrupt", error); throw error; }
     if (!round.accounts) {
       round.accounts = this.initialAccounts(); round.sessions = []; round.failures ??= {};
       await this.save(round);
