@@ -3,7 +3,6 @@ import { mkdir, readFile, open, rename, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { drawRecipients } from "./draw";
-import { INITIAL_ACTIVATION_HASHES } from "./activation-config";
 import { ACCOUNT_EMAILS, normalizeEmail, validMapping } from "./accounts";
 import { digest, newToken, validToken, validPassword, hashPassword, verifyPassword } from "./password";
 import type { CardStatus } from "./card";
@@ -13,10 +12,11 @@ type Assignment = { name: ParticipantName; recipientName: ParticipantName; opene
 type Account = { name: ParticipantName; email: string; status: "pending" | "active"; activationHash: string | null; activatedAt: string | null; password: { salt: string; hash: string } | null };
 type Session = { hash: string; name: ParticipantName; expiresAt: number };
 type Failure = { count: number; until: number };
-type Round = { version: 1; drawnAt: string | null; assignments: Assignment[]; accounts?: Account[]; sessions?: Session[]; failures?: Record<string, Failure> };
+type Round = { version: 1; drawnAt: string | null; assignments: Assignment[]; accounts?: Account[]; sessions?: Session[]; failures?: Record<string, Failure>; enrollments?: Session[] };
 export const SESSION_SECONDS = 30 * 24 * 60 * 60;
 const LOGIN_ERROR = "ელფოსტა ან პაროლი არასწორია";
-const ACTIVATION_ERROR = "გასააქტიურებელი ბმული ან მონაცემები არასწორია";
+export const SETUP_SECONDS = 10 * 60;
+const PAIR_ERROR = "სახელი და ელფოსტა არ ემთხვევა";
 
 // Shared across service instances and module reloads within this Node.js process.
 const processState = globalThis as typeof globalThis & { santaFileQueues?: Map<string, Promise<void>> };
@@ -40,6 +40,10 @@ function parseRound(raw: string): Round {
     for (const session of value.sessions) if (!validToken(session.hash) || !isParticipantName(session.name) || !Number.isFinite(session.expiresAt)) throw new Error("Invalid session");
     for (const failure of Object.values(value.failures) as Failure[]) if (!Number.isInteger(failure?.count) || failure.count < 0 || !Number.isFinite(failure.until)) throw new Error("Invalid rate limit");
   }
+  if (value.enrollments !== undefined) {
+    if (!Array.isArray(value.enrollments)) throw new Error("Invalid setup sessions");
+    for (const session of value.enrollments) if (!validToken(session.hash) || !isParticipantName(session.name) || !Number.isFinite(session.expiresAt)) throw new Error("Invalid setup session");
+  }
   if (value.drawnAt === null && value.assignments.length === 0) return value;
   if (!validDate(value.drawnAt) || value.assignments.length !== 6) throw new Error("Invalid saved round");
   const names = new Set<string>();
@@ -53,7 +57,7 @@ function parseRound(raw: string): Round {
 }
 export class SantaService {
   private path: string;
-  constructor(path = join(process.cwd(), "data", "secret-santa.json"), private initialActivationHashes = INITIAL_ACTIVATION_HASHES) { this.path = resolve(/* turbopackIgnore: true */ path); }
+  constructor(path = join(process.cwd(), "data", "secret-santa.json")) { this.path = resolve(/* turbopackIgnore: true */ path); }
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const previous = queues.get(this.path) ?? Promise.resolve();
     const current = previous.then(operation);
@@ -96,31 +100,24 @@ export class SantaService {
       // All callers hold the same per-file queue. Only an actually missing file is initialized.
       const initial: Round = {
         version: 1, drawnAt: null, assignments: [],
-        accounts: PARTICIPANTS.map(name => {
-          const activationHash = this.initialActivationHashes[name] ?? null;
-          if (activationHash !== null && !validToken(activationHash)) throw new Error("Invalid bootstrap activation hash");
-          return { name, email: ACCOUNT_EMAILS[name], status: "pending", activationHash, activatedAt: null, password: null };
-        }),
-        sessions: [], failures: {},
+        accounts: this.initialAccounts(), sessions: [], failures: {}, enrollments: [],
       };
       await this.save(initial);
       return initial;
     }
-    // Existing files are read as-is. Neither corrupt data nor permission errors trigger replacement.
-    try { return parseRound(raw); }
+    // Existing account records are never reseeded; name-only legacy rounds gain accounts without changing their draw.
+    let round: Round;
+    try { round = parseRound(raw); }
     catch (error) { this.storageError("corrupt", error); throw error; }
+    if (!round.accounts) {
+      round.accounts = this.initialAccounts(); round.sessions = []; round.failures ??= {};
+      await this.save(round);
+    }
+    return round;
   }
   async initialize() { await this.exclusive(async () => { await this.load(); }); }
-  async provisionAccounts() {
-    return this.exclusive(async () => {
-      const round = await this.load();
-      if (round.accounts?.some(account => account.status !== "pending" || account.activationHash !== null)) throw new Error("Accounts already provisioned; existing accounts and links were not changed.");
-      const links = PARTICIPANTS.map(name => ({ name, email: ACCOUNT_EMAILS[name], token: newToken() }));
-      round.accounts = links.map(({ name, email, token }) => ({ name, email, status: "pending", activationHash: digest(token), activatedAt: null, password: null }));
-      round.sessions = []; round.failures = {};
-      await this.save(round);
-      return links;
-    });
+  private initialAccounts(): Account[] {
+    return PARTICIPANTS.map(name => ({ name, email: ACCOUNT_EMAILS[name], status: "pending", activationHash: null, activatedAt: null, password: null }));
   }
   private limited(round: Round, key: string) {
     const now = Date.now();
@@ -156,20 +153,44 @@ export class SantaService {
     round.sessions.push({ hash: digest(token), name: account.name, expiresAt: Date.now() + SESSION_SECONDS * 1000 });
     return token;
   }
-  async activate(input: { token?: unknown; name?: unknown; email?: unknown; password?: unknown }) {
+  async startSetup(name: unknown, email: unknown, previousToken?: string) {
     return this.exclusive(async () => {
       const round = await this.load();
-      const key = "activate:" + digest(typeof input.token === "string" ? input.token.slice(0, 128) : "");
+      const normalized = normalizeEmail(email);
+      const key = "setup:" + digest(normalized.slice(0, 254));
       this.limited(round, key);
-      const account = validToken(input.token) && round.accounts?.find(a => a.activationHash === digest(input.token as string) && a.status === "pending");
-      const name = typeof input.name === "string" ? input.name.trim().normalize("NFC") : "";
-      if (!account || account.name !== name || account.email !== normalizeEmail(input.email)) return this.failed(round, key, ACTIVATION_ERROR, 400);
-      if (!validPassword(input.password)) throw new SantaError(400, "პაროლი უნდა შეიცავდეს 10–128 სიმბოლოს.");
-      account.password = await hashPassword(input.password);
-      account.status = "active"; account.activatedAt = new Date().toISOString(); account.activationHash = null;
-      const token = this.session(round, account);
+      const normalizedName = typeof name === "string" ? name.trim().normalize("NFC") : "";
+      const account = round.accounts?.find(a => a.name === normalizedName && a.email === normalized);
+      if (!account) return this.failed(round, key, PAIR_ERROR, 400);
+      round.enrollments = (round.enrollments ?? []).filter(s => s.expiresAt > Date.now() && (!validToken(previousToken) || s.hash !== digest(previousToken)));
       delete round.failures![key];
-      // Account activation, password, link consumption, and session are one atomic write.
+      if (account.password || account.status === "active") {
+        await this.save(round);
+        return { mode: "login" as const };
+      }
+      // At most five short-lived setup sessions per participant, even across browsers.
+      const own = round.enrollments.filter(s => s.name === account.name);
+      if (own.length >= 5) round.enrollments = round.enrollments.filter(s => s !== own[0]);
+      const token = newToken();
+      round.enrollments.push({ hash: digest(token), name: account.name, expiresAt: Date.now() + SETUP_SECONDS * 1000 });
+      await this.save(round);
+      return { mode: "password" as const, token };
+    });
+  }
+  async setPassword(setupToken: unknown, password: unknown) {
+    return this.exclusive(async () => {
+      const round = await this.load();
+      const setup = validToken(setupToken) ? round.enrollments?.find(s => s.hash === digest(setupToken)) : undefined;
+      if (!setup) throw new SantaError(409, "პაროლის დაყენების სესია აღარ მოქმედებს. დაიწყე თავიდან ან გამოიყენე შესვლა.");
+      if (setup.expiresAt <= Date.now()) throw new SantaError(410, "სესიის ვადა გავიდა. თავიდან შეიყვანე სახელი და ელფოსტა.");
+      const account = round.accounts?.find(a => a.name === setup.name);
+      if (!account || account.password || account.status === "active") throw new SantaError(409, "პაროლი უკვე დაყენებულია. გამოიყენე შესვლა.");
+      if (!validPassword(password)) throw new SantaError(400, "პაროლი უნდა შეიცავდეს 10–128 სიმბოლოს.");
+      account.password = await hashPassword(password);
+      account.status = "active"; account.activatedAt = new Date().toISOString(); account.activationHash = null;
+      // Consume all setup sessions for this participant in the same atomic write as their password.
+      round.enrollments = round.enrollments!.filter(s => s.name !== account.name);
+      const token = this.session(round, account);
       await this.save(round);
       return { token, card: this.card(round, account.name) };
     });

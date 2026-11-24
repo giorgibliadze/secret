@@ -5,7 +5,8 @@ import type { CardStatus } from "@/lib/card";
 const fieldClass = "mt-2 w-full rounded-xl border border-[#dce2d7] bg-[#fcfdf9] p-3 outline-none focus:border-[#668354] focus:ring-2 focus:ring-[#668354]/20 disabled:opacity-60";
 export default function Home() {
   const [card, setCard] = useState<CardStatus | null>(null);
-  const [activation, setActivation] = useState("");
+  const [mode, setMode] = useState<"first" | "login">("first");
+  const [step, setStep] = useState<"identity" | "password">("identity");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -21,14 +22,7 @@ export default function Home() {
     async function restore() {
       // Remove the obsolete name-only browser selection; identity now comes from the HttpOnly cookie.
       try { sessionStorage.removeItem("secret-santa.selected-name"); } catch { /* Storage is optional. */ }
-      const fragment = new URLSearchParams(window.location.hash.slice(1));
-      const activationToken = fragment.get("activate");
-      await Promise.resolve();
-      if (!active) return;
-      if (activationToken !== null) {
-        setActivation(activationToken || "invalid"); setLoading(false);
-        return;
-      }
+      if (window.location.hash.startsWith("#activate=")) window.history.replaceState(null, "", window.location.pathname + window.location.search);
       try {
         const response = await fetch("/api/santa", { cache: "no-store", signal: controller.signal });
         const data = await response.json();
@@ -42,45 +36,55 @@ export default function Home() {
     return () => { active = false; controller.abort(); };
   }, []);
 
-  async function submit(action: "activate" | "login" | "reveal" | "logout") {
+  async function submit(action: "startSetup" | "setPassword" | "login" | "reveal" | "logout") {
     if (pending.current || (action === "reveal" && (!card || card.openedAt))) return;
     pending.current = true; setBusy(true); setError("");
     try {
-      const credentials = action === "activate" ? { token: activation, name, email, password } : action === "login" ? { email, password } : {};
+      const credentials = action === "startSetup" ? { name, email } : action === "setPassword" ? { password } : action === "login" ? { email, password } : {};
       const response = await fetch("/api/santa", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, ...credentials }), cache: "no-store" });
       const data = await response.json();
       if (!response.ok) {
         setError(data.error);
         if (response.status === 401 && action === "reveal") setCard(null);
+        if (action === "setPassword" && [409, 410].includes(response.status)) {
+          setStep("identity"); setPassword("");
+          if (response.status === 409) setMode("login");
+        }
+        return;
+      }
+      if (action === "startSetup") {
+        setPassword("");
+        if (data.mode === "login") { setMode("login"); setStep("identity"); }
+        else setStep("password");
         return;
       }
       setPassword("");
-      if (action === "logout") { setCard(null); setEmail(""); setName(""); setHidden(false); }
+      if (action === "logout") { setCard(null); setEmail(""); setName(""); setHidden(false); setMode("login"); setStep("identity"); }
       else { setCard(data); setHidden(false); }
-      if (action === "activate") {
-        setActivation(""); setName(""); setEmail("");
-        window.history.replaceState(null, "", window.location.pathname + window.location.search);
-      }
+
     } catch { setError("კავშირი გაწყდა. სცადე ხელახლა — შენახული შედეგი არ შეიცვლება."); }
     finally { pending.current = false; setBusy(false); }
   }
-  function leaveActivation() {
-    setActivation(""); setName(""); setPassword(""); setEmail(""); setError("");
-    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  function changeMode(value: "first" | "login") {
+    setMode(value); setStep("identity"); setName(""); setPassword(""); setError("");
   }
   return (
     <main className="flex min-h-screen items-center justify-center px-5 py-10">
       <section aria-label="Secret Santa" className="w-full max-w-md rounded-3xl border border-[#e0e4db] bg-white p-6 shadow-[0_12px_50px_#293d2010] sm:p-8">
         {loading ? <p role="status" className="text-center text-sm text-[#617065]">იტვირთება…</p> : !card ? (
-          <form onSubmit={event => { event.preventDefault(); void submit(activation ? "activate" : "login"); }} className="space-y-5">
-            <h1 className="text-xl font-bold">{activation ? "ანგარიშის გააქტიურება" : "შესვლა"}</h1>
-            {activation && <label htmlFor="name" className="block text-sm font-medium">სახელი<input id="name" name="name" required maxLength={80} autoComplete="name" value={name} onChange={event => setName(event.target.value)} disabled={busy} className={fieldClass} /></label>}
-            <label htmlFor="email" className="block text-sm font-medium">ელფოსტა<input id="email" name="email" type="email" required maxLength={254} autoComplete="username" value={email} onChange={event => setEmail(event.target.value)} disabled={busy} className={fieldClass} /></label>
-            <label htmlFor="password" className="block text-sm font-medium">{activation ? "ახალი პაროლი" : "პაროლი"}<input id="password" name="password" type="password" required minLength={activation ? 10 : undefined} maxLength={128} autoComplete={activation ? "new-password" : "current-password"} value={password} onChange={event => setPassword(event.target.value)} disabled={busy} className={fieldClass} /></label>
-            {activation && <p className="text-xs leading-6 text-[#617065]">გამოიყენე 10–128 სიმბოლო. ეს ბმული მხოლოდ ერთხელ გააქტიურდება.</p>}
-            <button type="submit" className="primary" disabled={busy}>{busy ? "მუშავდება…" : activation ? "გააქტიურება" : "შესვლა"}</button>
-            {activation && <button type="button" disabled={busy} onClick={leaveActivation} className="w-full p-2 text-sm text-[#516453]">შესვლის გვერდზე დაბრუნება</button>}
-          </form>
+          <div>
+            <div className="mb-6 grid grid-cols-2 gap-2" aria-label="შესვლის რეჟიმი">
+              <button type="button" aria-pressed={mode === "first"} disabled={busy} onClick={() => changeMode("first")} className={`rounded-xl p-3 text-sm ${mode === "first" ? "bg-[#284b38] text-white" : "bg-[#f0f3ea] text-[#516453]"}`}>პირველად შევდივარ</button>
+              <button type="button" aria-pressed={mode === "login"} disabled={busy} onClick={() => changeMode("login")} className={`rounded-xl p-3 text-sm ${mode === "login" ? "bg-[#284b38] text-white" : "bg-[#f0f3ea] text-[#516453]"}`}>შესვლა</button>
+            </div>
+            <form onSubmit={event => { event.preventDefault(); void submit(mode === "login" ? "login" : step === "identity" ? "startSetup" : "setPassword"); }} className="space-y-5">
+              {mode === "first" && step === "identity" && <label htmlFor="name" className="block text-sm font-medium">სახელი<input id="name" name="name" required maxLength={80} autoComplete="off" spellCheck={false} value={name} onChange={event => setName(event.target.value)} disabled={busy} className={fieldClass} /></label>}
+              {(mode === "login" || step === "identity") && <label htmlFor="email" className="block text-sm font-medium">ელფოსტა<input id="email" name="email" type="email" required maxLength={254} autoComplete="username" value={email} onChange={event => setEmail(event.target.value)} disabled={busy} className={fieldClass} /></label>}
+              {(mode === "login" || step === "password") && <label htmlFor="password" className="block text-sm font-medium">{mode === "first" ? "დააყენე პაროლი" : "პაროლი"}<input id="password" name="password" type="password" required minLength={mode === "first" ? 10 : undefined} maxLength={128} autoComplete={mode === "first" ? "new-password" : "current-password"} value={password} onChange={event => setPassword(event.target.value)} disabled={busy} className={fieldClass} /></label>}
+              {mode === "first" && step === "password" && <p className="text-xs leading-6 text-[#617065]">გამოიყენე 10–128 სიმბოლო. სესია მოქმედებს 10 წუთით.</p>}
+              <button type="submit" className="primary" disabled={busy}>{busy ? "მუშავდება…" : mode === "login" ? "შესვლა" : step === "identity" ? "გაგრძელება" : "პაროლის შენახვა"}</button>
+            </form>
+          </div>
         ) : (
           <div className="text-center">
             <h1 className="mb-5 text-xl font-bold">შენი საიდუმლო ბარათი</h1>
