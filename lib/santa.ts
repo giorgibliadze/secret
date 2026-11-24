@@ -3,6 +3,7 @@ import { mkdir, readFile, open, rename, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { drawRecipients } from "./draw";
+import { INITIAL_ACTIVATION_HASHES } from "./activation-config";
 import { ACCOUNT_EMAILS, normalizeEmail, validMapping } from "./accounts";
 import { digest, newToken, validToken, validPassword, hashPassword, verifyPassword } from "./password";
 import type { CardStatus } from "./card";
@@ -34,7 +35,7 @@ function parseRound(raw: string): Round {
     if (!Array.isArray(value.accounts) || !validMapping(value.accounts) || !Array.isArray(value.sessions) || !value.failures || typeof value.failures !== "object" || Array.isArray(value.failures)) throw new Error("Invalid saved accounts");
     for (const account of value.accounts) {
       const active = account.status === "active";
-      if (active ? (!validDate(account.activatedAt) || account.activationHash !== null || !/^[a-f0-9]{32}$/.test(account.password?.salt ?? "") || !/^[a-f0-9]{128}$/.test(account.password?.hash ?? "")) : (account.status !== "pending" || !validToken(account.activationHash) || account.password !== null || account.activatedAt !== null)) throw new Error("Invalid account");
+      if (active ? (!validDate(account.activatedAt) || account.activationHash !== null || !/^[a-f0-9]{32}$/.test(account.password?.salt ?? "") || !/^[a-f0-9]{128}$/.test(account.password?.hash ?? "")) : (account.status !== "pending" || (account.activationHash !== null && !validToken(account.activationHash)) || account.password !== null || account.activatedAt !== null)) throw new Error("Invalid account");
     }
     for (const session of value.sessions) if (!validToken(session.hash) || !isParticipantName(session.name) || !Number.isFinite(session.expiresAt)) throw new Error("Invalid session");
     for (const failure of Object.values(value.failures) as Failure[]) if (!Number.isInteger(failure?.count) || failure.count < 0 || !Number.isFinite(failure.until)) throw new Error("Invalid rate limit");
@@ -52,7 +53,7 @@ function parseRound(raw: string): Round {
 }
 export class SantaService {
   private path: string;
-  constructor(path = join(process.cwd(), "data", "secret-santa.json")) { this.path = resolve(/* turbopackIgnore: true */ path); }
+  constructor(path = join(process.cwd(), "data", "secret-santa.json"), private initialActivationHashes = INITIAL_ACTIVATION_HASHES) { this.path = resolve(/* turbopackIgnore: true */ path); }
   private async exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const previous = queues.get(this.path) ?? Promise.resolve();
     const current = previous.then(operation);
@@ -62,6 +63,10 @@ export class SantaService {
     finally { if (queues.get(this.path) === settled) queues.delete(this.path); }
   }
   private async save(round: Round) {
+    try { await this.atomicSave(round); }
+    catch (error) { this.storageError("write", error); throw error; }
+  }
+  private async atomicSave(round: Round) {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
@@ -74,23 +79,42 @@ export class SantaService {
       await unlink(temporary).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
     }
   }
+  private storageError(kind: "read" | "write" | "corrupt", error: unknown) {
+    // Never log the file contents, passwords, activation tokens, or raw error messages.
+    const rawCode = (error as NodeJS.ErrnoException)?.code;
+    const code = typeof rawCode === "string" && /^E[A-Z0-9_]+$/.test(rawCode) ? rawCode : undefined;
+    console.error("[secret-santa] storage error", { kind, ...(code ? { code } : {}) });
+  }
   private async load(): Promise<Round> {
     let raw: string;
     try { raw = await readFile(this.path, "utf8"); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const empty: Round = { version: 1, drawnAt: null, assignments: [] };
-      await this.save(empty);
-      return empty;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.storageError("read", error);
+        throw error;
+      }
+      // All callers hold the same per-file queue. Only an actually missing file is initialized.
+      const initial: Round = {
+        version: 1, drawnAt: null, assignments: [],
+        accounts: PARTICIPANTS.map(name => {
+          const activationHash = this.initialActivationHashes[name] ?? null;
+          if (activationHash !== null && !validToken(activationHash)) throw new Error("Invalid bootstrap activation hash");
+          return { name, email: ACCOUNT_EMAILS[name], status: "pending", activationHash, activatedAt: null, password: null };
+        }),
+        sessions: [], failures: {},
+      };
+      await this.save(initial);
+      return initial;
     }
-    // A corrupt file must fail closed, never silently create a different draw.
-    return parseRound(raw);
+    // Existing files are read as-is. Neither corrupt data nor permission errors trigger replacement.
+    try { return parseRound(raw); }
+    catch (error) { this.storageError("corrupt", error); throw error; }
   }
   async initialize() { await this.exclusive(async () => { await this.load(); }); }
   async provisionAccounts() {
     return this.exclusive(async () => {
       const round = await this.load();
-      if (round.accounts) throw new Error("Accounts already provisioned; existing accounts and links were not changed.");
+      if (round.accounts?.some(account => account.status !== "pending" || account.activationHash !== null)) throw new Error("Accounts already provisioned; existing accounts and links were not changed.");
       const links = PARTICIPANTS.map(name => ({ name, email: ACCOUNT_EMAILS[name], token: newToken() }));
       round.accounts = links.map(({ name, email, token }) => ({ name, email, status: "pending", activationHash: digest(token), activatedAt: null, password: null }));
       round.sessions = []; round.failures = {};

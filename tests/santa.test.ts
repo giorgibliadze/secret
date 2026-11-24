@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, readdir, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,7 +17,7 @@ async function setup(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), "secret-santa-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, "data", "secret-santa.json");
-  const service = new SantaService(path);
+  const service = new SantaService(path, {});
   await service.initialize();
   return { path, service, read: async () => JSON.parse(await readFile(path, "utf8")) };
 }
@@ -161,18 +161,101 @@ test("expired sessions cannot read or open cards",async t=>{
 });
 
 
-test("organizer CLI creates six private links once and never overwrites existing state", async t => {
+test("organizer CLI refuses to replace configured activation links or existing state", async t => {
   const { path } = await setup(t);
   const cwd = join(path, "..", "..");
+  await rm(path);
   const loader = createRequire(resolve("package.json")).resolve("tsx");
   const command = ["--conditions=react-server", "--import", loader, resolve("scripts/provision-accounts.ts"), "--base-url", "https://santa.example"];
-  const run = () => promisify(execFile)(process.execPath, command, { cwd });
-  const result = await run();
-  assert.ok(!result.stdout.includes("#activate="));
-  const exported = await readFile(join(cwd, "data/activation-links.txt"), "utf8");
-  assert.equal((exported.match(/https:\/\/santa\.example\/#activate=[a-f0-9]{64}/g) ?? []).length, 6);
-  const saved = await readFile(path, "utf8");
-  await assert.rejects(run());
-  assert.equal(await readFile(path, "utf8"), saved);
-  assert.equal(await readFile(join(cwd, "data/activation-links.txt"), "utf8"), exported);
+  await assert.rejects(promisify(execFile)(process.execPath, command, { cwd }));
+  const saved = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(saved.accounts.length, 6);
+  assert.ok(saved.accounts.every((a: { activationHash: string }) => a.activationHash));
+  await assert.rejects(readFile(join(cwd, "data/activation-links.txt")), { code: "ENOENT" });
+});
+
+test("first login in a missing data directory initializes all inactive accounts and continues validation", async t => {
+  const { path } = await setup(t);
+  await rm(join(path, ".."), { recursive: true });
+  const api = apiFor(path);
+  const response = await api.post({ action: "login", email: ACCOUNT_EMAILS["გიორგი"], password });
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { error: "ელფოსტა ან პაროლი არასწორია" });
+  const initial = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(initial.accounts.length, 6);
+  for (const account of initial.accounts) {
+    assert.equal(account.email, ACCOUNT_EMAILS[account.name as keyof typeof ACCOUNT_EMAILS]);
+    assert.equal(account.status, "pending"); assert.equal(account.password, null); assert.equal(account.activatedAt, null);
+  }
+  assert.equal(initial.drawnAt, null); assert.deepEqual(initial.assignments, []);
+  assert.equal(Object.keys(initial.failures).length, 2); // The same request reached normal credential validation.
+});
+
+test("first activation creates missing accounts once under concurrent requests, then saved login returns its card", async t => {
+  const { path } = await setup(t);
+  await rm(join(path, ".."), { recursive: true });
+  const { digest, newToken } = await import("../lib/password");
+  const activationToken = newToken();
+  let creations = 0;
+  const hashes = {};
+  Object.defineProperty(hashes, "გიორგი", { get() { creations++; return digest(activationToken); } });
+  const request = { token: activationToken, name: "გიორგი", email: ` ${ACCOUNT_EMAILS["გიორგი"].toUpperCase()} `, password };
+  const results = await Promise.allSettled([
+    new SantaService(path, hashes).activate(request),
+    new SantaService(path, hashes).activate({ ...request, password: "Replacement-strong-password" }),
+  ]);
+  assert.equal(creations, 1);
+  assert.equal(results[0].status, "fulfilled"); assert.equal(results[1].status, "rejected");
+  if (results[0].status !== "fulfilled") assert.fail("activation failed");
+  const activated = results[0].value;
+  const saved = JSON.parse(await readFile(path, "utf8"));
+  assert.equal(saved.accounts.length, 6); assert.equal(saved.accounts[0].status, "active");
+  assert.match(saved.accounts[0].password.hash, /^[a-f0-9]{128}$/);
+  assert.match(saved.accounts[0].password.salt, /^[a-f0-9]{32}$/);
+  assert.equal(saved.accounts[0].activationHash, null);
+  assert.equal(saved.drawnAt, null); assert.deepEqual(saved.assignments, []);
+  const service = new SantaService(path);
+  const card = await service.reveal(activated.token);
+  await service.logout(activated.token);
+  const login = await new SantaService(path).login(request.email, password);
+  assert.deepEqual(login.card, card);
+  assert.deepEqual(await service.reveal(login.token), card);
+  assert.equal(creations, 1);
+  const after = JSON.parse(await readFile(path, "utf8"));
+  assert.deepEqual(after.accounts[0].password, saved.accounts[0].password);
+});
+
+test("existing JSON is not reseeded, corrupt data and filesystem failures have separate safe logs", async t => {
+  const { path, service } = await setup(t);
+  const log = t.mock.method(console, "error", () => {});
+  const original = await readFile(path, "utf8");
+  const poisonousConfig = {};
+  Object.defineProperty(poisonousConfig, "გიორგი", { get() { throw new Error("must not read bootstrap config"); } });
+  await new SantaService(path, poisonousConfig).initialize();
+  assert.equal(await readFile(path, "utf8"), original);
+  await writeFile(path, "{ PRIVATE_DATA_DO_NOT_LOG");
+  await assert.rejects(service.initialize());
+  assert.deepEqual(log.mock.calls[0].arguments, ["[secret-santa] storage error", { kind: "corrupt" }]);
+  assert.equal(await readFile(path, "utf8"), "{ PRIVATE_DATA_DO_NOT_LOG");
+  const directoryAsFile = new SantaService(join(path, ".."));
+  await assert.rejects(directoryAsFile.initialize());
+  assert.equal(log.mock.calls[1].arguments[1].kind, "read");
+  assert.equal(log.mock.calls[1].arguments[1].code, "EISDIR");
+  assert.ok(!JSON.stringify(log.mock.calls).includes("PRIVATE_DATA_DO_NOT_LOG"));
+});
+
+test("initial write permission failures are logged and the missing file is not replaced", async t => {
+  if (process.getuid?.() === 0) { t.skip("root bypasses filesystem permissions"); return; }
+  const { path, service } = await setup(t);
+  await rm(path);
+  const dir = join(path, "..");
+  const log = t.mock.method(console, "error", () => {});
+  await chmod(dir, 0o500);
+  try {
+    await assert.rejects(service.initialize(), { code: "EACCES" });
+    assert.ok(log.mock.calls.some(call => call.arguments[1]?.kind === "write" && call.arguments[1]?.code === "EACCES"));
+  } finally { await chmod(dir, 0o700); }
+  await assert.rejects(readFile(path), { code: "ENOENT" });
+  await service.initialize();
+  assert.equal(JSON.parse(await readFile(path, "utf8")).accounts.length, 6);
 });
