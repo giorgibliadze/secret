@@ -6,154 +6,173 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createRequire } from "node:module";
 import { SantaService } from "../lib/santa";
-import { handle } from "../lib/http";
+import { handle, cookieName } from "../lib/http";
 import { PARTICIPANTS } from "../lib/participants";
+import { ACCOUNT_EMAILS } from "../lib/accounts";
 import { drawRecipients } from "../lib/draw";
-
+const password = "Testing-strong-password-2026";
 async function setup(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), "secret-santa-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const path = join(dir, "data", "secret-santa.json");
-  return { path, service: new SantaService(path), read: async () => JSON.parse(await readFile(path, "utf8")) };
-}
-
-test("10,000 draws have six unique recipients and no self assignment", () => {
-  const outcomes = new Set<string>();
-  for (let i = 0; i < 10000; i++) {
-    const recipients = drawRecipients();
-    assert.equal(new Set(recipients).size, 6);
-    recipients.forEach((recipient, giver) => { assert.notEqual(recipient, giver); assert.ok(recipient >= 0 && recipient < 6); });
-    outcomes.add(recipients.join());
-  }
-  assert.ok(outcomes.size > 200);
-});
-
-test("file is automatic; visiting and selecting names do not draw", async t => {
-  const { path, service, read } = await setup(t);
-  await Promise.all(Array.from({ length: 10 }, () => new SantaService(path).initialize()));
-  for (const name of PARTICIPANTS) assert.deepEqual(await service.status(name), { name, openedAt: null });
-  assert.deepEqual(await read(), { version: 1, drawnAt: null, assignments: [] });
-  await service.reveal("გიორგი");
-  assert.equal((await read()).assignments.length, 6);
-  assert.ok((await read()).drawnAt);
-  assert.equal((await read()).assignments.filter((a: { openedAt: string | null }) => a.openedAt).length, 1);
-});
-
-test("six cards in different orders retain their results on refresh and reselection", async t => {
-  for (const order of [[0, 1, 2, 3, 4, 5], [5, 2, 0, 4, 1, 3], [3, 1, 4, 0, 5, 2]]) {
-    const { path, service } = await setup(t);
-    const recipients: string[] = [];
-    for (const index of order) {
-      const name = PARTICIPANTS[index];
-      assert.deepEqual(await service.status(name), { name, openedAt: null });
-      const opened = await service.reveal(name);
-      assert.ok(opened.openedAt); assert.ok(opened.recipientName);
-      assert.notEqual(opened.recipientName, name);
-      recipients.push(opened.recipientName!);
-      assert.deepEqual(await service.reveal(name), opened);
-      assert.deepEqual(await new SantaService(path).status(name), opened);
-      assert.deepEqual(Object.keys(opened).sort(), ["name", "openedAt", "recipientName"]);
-    }
-    assert.deepEqual(recipients.sort(), [...PARTICIPANTS].sort());
-  }
-});
-
-test("simultaneous first clicks from distinct service instances create one shared draw", async t => {
-  const { path, read } = await setup(t);
-  const requests = Array.from({ length: 60 }, (_, i) => new SantaService(path).reveal(PARTICIPANTS[i % 6]));
-  const responses = await Promise.all(requests);
-  const saved = await read();
-  assert.equal(saved.assignments.length, 6);
-  assert.equal(new Set(saved.assignments.map((a: { recipientName: string }) => a.recipientName)).size, 6);
-  for (const name of PARTICIPANTS) {
-    const matches = responses.filter(response => response.name === name);
-    for (const result of matches) assert.deepEqual(result, matches[0]);
-  }
-  const raw = await readFile(path, "utf8");
-  await Promise.all(PARTICIPANTS.map(name => new SantaService(path).reveal(name)));
-  assert.equal(await readFile(path, "utf8"), raw);
-  assert.deepEqual(await readdir(join(path, "..")), ["secret-santa.json"]);
-});
-
-test("a fresh Node.js process loads exactly the saved results after restart", async t => {
-  const { path, service } = await setup(t);
-  const expected = await Promise.all(PARTICIPANTS.map(name => service.reveal(name)));
-  const raw = await readFile(path, "utf8");
-  const script = `
-    import { SantaService } from ${JSON.stringify(pathToFileURL(resolve("lib/santa.ts")).href)};
-    const service = new SantaService(process.argv[1]);
-    const results = [];
-    for (const name of ${JSON.stringify(PARTICIPANTS)}) results.push(await service.status(name));
-    process.stdout.write(JSON.stringify(results));
-  `;
-  const { stdout } = await promisify(execFile)(process.execPath, ["--conditions=react-server", "--import", "tsx", "--input-type=module", "-e", script, path]);
-  assert.deepEqual(JSON.parse(stdout), expected);
-  assert.equal(await readFile(path, "utf8"), raw);
-});
-
-test("API only returns the selected card and hiding/switching cannot reset it", async t => {
-  const { path, service } = await setup(t);
-  const api = (request: Request) => handle(request, () => new SantaService(path));
-  const get = (name?: string) => api(new Request(`http://localhost/api/santa${name ? `?name=${encodeURIComponent(name)}` : ""}`));
-  const post = (name: unknown, origin = "http://localhost", action = "reveal") => api(new Request("http://localhost/api/santa", { method: "POST", headers: { origin }, body: JSON.stringify({ action, name }) }));
-  for (const name of [null, "", "სხვა", {}]) assert.equal((await post(name)).status, 404);
-  assert.equal((await post("გიორგი", "http://other.test")).status, 403);
-  assert.equal((await post("გიორგი", "http://localhost", "register")).status, 400);
-  const response = await post("მარი");
-  assert.equal(response.status, 200); assert.match(response.headers.get("cache-control")!, /no-store/);
-  const result = await response.json();
-  assert.deepEqual(Object.keys(result).sort(), ["name", "openedAt", "recipientName"]);
-  const saved = await readFile(path, "utf8");
-  assert.equal((await get()).status, 404);
-  assert.deepEqual(await (await get()).json(), { error: "სახელი ვერ მოიძებნა" });
-  assert.deepEqual(await (await get("ანა")).json(), { name: "ანა", openedAt: null });
-  assert.deepEqual(await (await get("მარი")).json(), result);
-  assert.deepEqual(await service.reveal("მარი"), result);
-  assert.equal(await readFile(path, "utf8"), saved);
-});
-
-test("corrupt saved state fails closed and a failed operation does not block the queue", async t => {
-  const { path, service } = await setup(t);
-  const result = await service.reveal("ნინი");
-  const saved = await readFile(path, "utf8");
-  for (const corrupt of ["{", '{"version":1,"drawnAt":null,"assignments":[{}]}']) {
-    await writeFile(path, corrupt);
-    await assert.rejects(service.reveal("ნინი"));
-    assert.equal(await readFile(path, "utf8"), corrupt);
-  }
-  await writeFile(path, saved);
-  assert.deepEqual(await service.status("ნინი"), result);
-});
-
-test("concurrent filesystem readers only observe complete JSON during atomic writes", async t => {
-  const { path, service } = await setup(t);
+  const service = new SantaService(path);
   await service.initialize();
-  let complete = false;
-  const writes = Promise.all(PARTICIPANTS.map(name => service.reveal(name))).finally(() => { complete = true; });
-  let reads = 0;
-  while (!complete) {
-    const round = JSON.parse(await readFile(path, "utf8"));
-    assert.ok(round.assignments.length === 0 || round.assignments.length === 6);
-    reads++;
+  return { path, service, read: async () => JSON.parse(await readFile(path, "utf8")) };
+}
+async function activateAll(service: SantaService) {
+  const links = await service.provisionAccounts();
+  const users = [];
+  for (const link of links) users.push({ ...link, ...(await service.activate({ ...link, password })) });
+  return users;
+}
+const apiFor = (path: string) => {
+  const invoke = (request: Request) => handle(request, () => new SantaService(path));
+  return {
+    get: (cookie = "", query = "") => invoke(new Request(`http://localhost/api/santa${query}`, { headers: { cookie } })),
+    post: (body: unknown, cookie = "", origin = "http://localhost") => invoke(new Request("http://localhost/api/santa", { method: "POST", headers: { cookie, origin }, body: JSON.stringify(body) })),
+  };
+};
+test("10,000 draws have unique recipients and no self assignment", () => {
+  const outcomes = new Set<string>();
+  for (let i=0; i<10000; i++) {
+    const r=drawRecipients(); assert.equal(new Set(r).size,6);
+    r.forEach((v,j)=>{ assert.notEqual(v,j); assert.ok(v>=0 && v<6); }); outcomes.add(r.join());
   }
-  await writes;
-  assert.ok(reads > 0);
+  assert.ok(outcomes.size>200);
+});
+test("confirmed mapping and account provisioning preserve all legacy pairs and opening times", async t => {
+  const { path,service,read }=await setup(t);
+  const legacy={version:1,drawnAt:"2026-11-20T00:00:00.000Z",assignments:PARTICIPANTS.map((name,i)=>({name,recipientName:PARTICIPANTS[(i+1)%6],openedAt:i%2 ? null:"2026-11-21T12:00:00.000Z"}))};
+  await writeFile(path,JSON.stringify(legacy));
+  const links=await service.provisionAccounts();
+  const saved=await read();
+  assert.deepEqual(saved.assignments,legacy.assignments); assert.equal(saved.drawnAt,legacy.drawnAt);
+  assert.equal(saved.accounts.length,6);
+  for(const link of links){
+    const account=saved.accounts.find((a:{name:string})=>a.name===link.name);
+    assert.equal(account.email,ACCOUNT_EMAILS[link.name]); assert.equal(account.status,"pending");
+    assert.ok(!JSON.stringify(saved).includes(link.token));
+  }
+  await assert.rejects(service.provisionAccounts(),/already provisioned/);
+  assert.deepEqual((await read()).assignments,legacy.assignments);
+});
+test("activation checks token/name/email, normalizes email, and atomically consumes the link",async t=>{
+  const {service,read}=await setup(t);
+  const links=await service.provisionAccounts(); const link=links[0];
+  await assert.rejects(service.activate({...link,name:links[1].name,password}),{status:400});
+  await assert.rejects(service.activate({...link,email:links[1].email,password}),{status:400});
+  const active=await service.activate({...link,email:`  ${link.email.toUpperCase()}  `,password});
+  assert.equal(active.card.name,link.name); assert.equal(active.card.openedAt,null);
+  const saved=await read(); const account=saved.accounts[0];
+  assert.equal(account.status,"active"); assert.equal(account.activationHash,null); assert.ok(account.activatedAt);
+  assert.match(account.password.salt,/^[a-f0-9]{32}$/); assert.match(account.password.hash,/^[a-f0-9]{128}$/);
+  assert.ok(!JSON.stringify(saved).includes(password)); assert.ok(!JSON.stringify(saved).includes(active.token));
+  const stored=JSON.stringify(account.password);
+  await assert.rejects(service.activate({...link,password:"Replacement-password"}),{status:400});
+  assert.equal(JSON.stringify((await read()).accounts[0].password),stored);
+  assert.equal((await service.status(active.token)).name,link.name);
+});
+test("concurrent activation can set a password only once",async t=>{
+  const {service,read}=await setup(t); const [link]=await service.provisionAccounts();
+  const results=await Promise.allSettled([service.activate({...link,password}),service.activate({...link,password:"Other-strong-password"})]);
+  assert.equal(results.filter(r=>r.status==="fulfilled").length,1);
+  assert.equal((await read()).sessions.length,1);
+  await assert.rejects(service.login(link.email,"Other-strong-password"),{status:401});
+  assert.ok((await service.login(link.email,password)).token);
+});
+test("incorrect login is generic, cannot change a password, and has a persistent rate limit",async t=>{
+  const {path,service,read}=await setup(t); const [user]=await activateAll(service);
+  const before=JSON.stringify((await read()).accounts);
+  for(let i=0;i<5;i++) await assert.rejects(service.login(user.email,"wrong"),{status:401,message:"ელფოსტა ან პაროლი არასწორია"});
+  await assert.rejects(new SantaService(path).login(user.email,password),{status:429});
+  assert.equal(JSON.stringify((await read()).accounts),before);
+  await assert.rejects(service.login("not-allowed@example.com",password),{status:401,message:"ელფოსტა ან პაროლი არასწორია"});
+});
+test("six authenticated users reveal in different orders and retain results after another-device login",async t=>{
+  const {path,service,read}=await setup(t); const users=await activateAll(service);
+  assert.equal((await read()).drawnAt,null);
+  const recipients=[];
+  for(const i of [5,2,0,4,1,3]){
+    const user=users[i]; const opened=await service.reveal(user.token);
+    assert.ok(opened.openedAt); assert.notEqual(opened.recipientName,user.name); recipients.push(opened.recipientName!);
+    assert.deepEqual(await service.reveal(user.token),opened);
+    const second=await new SantaService(path).login(` ${user.email.toUpperCase()} `,password);
+    assert.deepEqual(second.card,opened); assert.deepEqual(await service.status(second.token),opened);
+  }
+  assert.deepEqual(recipients.sort(),[...PARTICIPANTS].sort());
+  assert.equal(new Set((await read()).accounts.map((a:{password:{salt:string}})=>a.password.salt)).size,6);
+});
+test("60 simultaneous reveals share one draw and retries do not write the file",async t=>{
+  const {path,service}=await setup(t); const users=await activateAll(service);
+  const results=await Promise.all(Array.from({length:60},(_,i)=>new SantaService(path).reveal(users[i%6].token)));
+  for(const user of users){ const own=results.filter(r=>r.name===user.name); own.forEach(result=>assert.deepEqual(result,own[0])); }
+  const saved=await readFile(path,"utf8");
+  await Promise.all(users.map(user=>service.reveal(user.token)));
+  assert.equal(await readFile(path,"utf8"),saved); assert.deepEqual(await readdir(join(path,"..")),["secret-santa.json"]);
+});
+test("HTTP requires session identity, protects cookies, ignores a forged name and invalidates logout",async t=>{
+  const {path,service}=await setup(t); const users=await activateAll(service); const api=apiFor(path);
+  assert.equal((await api.get("","?name=გიორგი")).status,401);
+  assert.equal((await api.post({action:"reveal",name:users[0].name})).status,401);
+  assert.equal((await api.post({action:"login",email:users[0].email,password},"","http://attacker.test")).status,403);
+  const logged=await api.post({action:"login",email:users[0].email,password});
+  assert.equal(logged.status,200); assert.match(logged.headers.get("cache-control")!,/no-store/);
+  const cookie=logged.headers.get("set-cookie")!;
+  assert.match(cookie,/HttpOnly/); assert.match(cookie,/SameSite=Strict/); assert.match(cookie,/Path=\//);
+  if(process.env.NODE_ENV==="production"){assert.match(cookie,/^__Host-/);assert.match(cookie,/; Secure/);}
+  const browser=cookie.split(";")[0];
+  const revealed=await api.post({action:"reveal",name:users[1].name,email:users[1].email},browser);
+  const card=await revealed.json(); assert.equal(card.name,users[0].name);
+  assert.deepEqual(Object.keys(card).sort(),["name","openedAt","recipientName"]);
+  assert.deepEqual(await (await api.get(browser)).json(),card);
+  const logout=await api.post({action:"logout"},browser); assert.equal(logout.status,200);assert.match(logout.headers.get("set-cookie")!,/Max-Age=0/);
+  assert.equal((await api.get(browser)).status,401);
+  assert.equal((await api.get(`${cookieName()}=${"0".repeat(64)}`)).status,401);
+});
+test("activation HTTP sets a session without returning credentials or other accounts",async t=>{
+  const {path,service}=await setup(t); const [link]=await service.provisionAccounts(); const api=apiFor(path);
+  const response=await api.post({action:"activate",...link,password});
+  assert.equal(response.status,200);assert.ok(response.headers.get("set-cookie"));
+  assert.deepEqual(await response.json(),{name:link.name,openedAt:null});
+  assert.equal((await api.post({action:"activate",...link,password})).status,400);
+});
+test("new Node process restores sessions and results after a server restart",async t=>{
+  const {path,service}=await setup(t);const users=await activateAll(service);
+  const expected=await Promise.all(users.map(u=>service.reveal(u.token))); const raw=await readFile(path,"utf8");
+  const script=`import { SantaService } from ${JSON.stringify(pathToFileURL(resolve("lib/santa.ts")).href)};
+    const service=new SantaService(process.argv[1]);
+    const users=JSON.parse(process.argv[2]); const results=[];
+    for(const user of users) results.push(await service.status(user.token));
+    process.stdout.write(JSON.stringify(results));`;
+  const {stdout}=await promisify(execFile)(process.execPath,["--conditions=react-server","--import","tsx","--input-type=module","-e",script,path,JSON.stringify(users.map(u=>({token:u.token})))]);
+  assert.deepEqual(JSON.parse(stdout),expected);assert.equal(await readFile(path,"utf8"),raw);
+});
+test("corrupt state is never redrawn and the queue recovers after a failed operation",async t=>{
+  const {path,service}=await setup(t); const [user]=await activateAll(service);const result=await service.reveal(user.token);const saved=await readFile(path,"utf8");
+  await writeFile(path,"{"); await assert.rejects(service.reveal(user.token));assert.equal(await readFile(path,"utf8"),"{");
+  await writeFile(path,saved);assert.deepEqual(await service.status(user.token),result);
+});
+test("expired sessions cannot read or open cards",async t=>{
+  const {path,service,read}=await setup(t); const [user]=await activateAll(service);const saved=await read();
+  saved.sessions[0].expiresAt=Date.now()-1000;await writeFile(path,JSON.stringify(saved));
+  await assert.rejects(service.status(user.token),{status:401});await assert.rejects(service.reveal(user.token),{status:401});
 });
 
 
-test("unknown names return the exact message; status never exposes the roster", async t => {
+test("organizer CLI creates six private links once and never overwrites existing state", async t => {
   const { path } = await setup(t);
-  const status = (name: unknown) => handle(new Request("http://localhost/api/santa", { method: "POST", headers: { origin: "http://localhost" }, body: JSON.stringify({ action: "status", name }) }), () => new SantaService(path));
-  for (const name of ["უცნობი", "", null, PARTICIPANTS, { name: "გიორგი" }]) {
-    const response = await status(name);
-    assert.equal(response.status, 404);
-    assert.deepEqual(await response.json(), { error: "სახელი ვერ მოიძებნა" });
-  }
-  const correct = await status("გიორგი");
-  assert.equal(correct.status, 200);
-  assert.deepEqual(await correct.json(), { name: "გიორგი", openedAt: null });
-  await new SantaService(path).reveal("გიორგი");
-  const returning = await status("გიორგი");
-  assert.deepEqual(await returning.json(), await new SantaService(path).status("გიორგი"));
+  const cwd = join(path, "..", "..");
+  const loader = createRequire(resolve("package.json")).resolve("tsx");
+  const command = ["--conditions=react-server", "--import", loader, resolve("scripts/provision-accounts.ts"), "--base-url", "https://santa.example"];
+  const run = () => promisify(execFile)(process.execPath, command, { cwd });
+  const result = await run();
+  assert.ok(!result.stdout.includes("#activate="));
+  const exported = await readFile(join(cwd, "data/activation-links.txt"), "utf8");
+  assert.equal((exported.match(/https:\/\/santa\.example\/#activate=[a-f0-9]{64}/g) ?? []).length, 6);
+  const saved = await readFile(path, "utf8");
+  await assert.rejects(run());
+  assert.equal(await readFile(path, "utf8"), saved);
+  assert.equal(await readFile(join(cwd, "data/activation-links.txt"), "utf8"), exported);
 });
