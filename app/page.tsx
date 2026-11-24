@@ -1,69 +1,82 @@
-import Image from "next/image";
-
+"use client";
+import { useEffect, useRef, useState } from "react";
+import type { CardStatus } from "@/lib/card";
+const selectionKey = "secret-santa.selected-name";
 export default function Home() {
+  const [name, setName] = useState("");
+  const [card, setCard] = useState<CardStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const version = useRef(0);
+  const pending = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const current = version.current;
+    let saved = "";
+    try { saved = sessionStorage.getItem(selectionKey) ?? ""; } catch { /* Storage is optional. */ }
+    if (!saved) return;
+    async function restore() {
+      try {
+        const response = await fetch("/api/santa", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status", name: saved }), cache: "no-store", signal: controller.signal });
+        const data = await response.json();
+        if (!active || current !== version.current) return;
+        if (response.ok) { setName(data.name); setCard(data); }
+        else { setError(data.error); if (response.status === 404) { try { sessionStorage.removeItem(selectionKey); } catch {} } }
+      } catch { if (active && current === version.current) setError("კავშირი ვერ დამყარდა. შეიყვანე სახელი და სცადე ხელახლა."); }
+    }
+    void restore();
+    return () => { active = false; controller.abort(); };
+  }, []);
+
+  async function submit(action: "status" | "reveal") {
+    if (pending.current || (action === "reveal" && (!card || card.openedAt))) return;
+    pending.current = true;
+    const current = ++version.current;
+    setBusy(true); setError("");
+    try {
+      const response = await fetch("/api/santa", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, name: action === "status" ? name.trim().normalize("NFC") : card!.name }), cache: "no-store" });
+      const data = await response.json();
+      if (current !== version.current) return;
+      if (response.ok) {
+        setCard(data); setName(data.name);
+        try { sessionStorage.setItem(selectionKey, data.name); } catch { /* Storage is optional. */ }
+      } else setError(data.error);
+    } catch { if (current === version.current) setError("კავშირი გაწყდა. სცადე ხელახლა — შედეგი არ შეიცვლება."); }
+    finally { pending.current = false; if (current === version.current) setBusy(false); }
+  }
+  function hide() {
+    version.current++;
+    setCard(null); setName(""); setError(""); setBusy(false);
+    try { sessionStorage.removeItem(selectionKey); } catch { /* Storage is optional. */ }
+  }
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="flex min-h-screen items-center justify-center px-5 py-10">
+      <section aria-label="Secret Santa" className="w-full max-w-md rounded-3xl border border-[#e0e4db] bg-white p-6 shadow-[0_12px_50px_#293d2010] sm:p-8">
+        {!card ? (
+          <form onSubmit={event => { event.preventDefault(); void submit("status"); }} autoComplete="off" className="space-y-5">
+            <label htmlFor="participant" className="block text-sm font-medium">შეიყვანე შენი სახელი</label>
+            <input id="participant" name="participant" type="text" value={name} maxLength={80} autoComplete="off" autoCorrect="off" spellCheck={false} disabled={busy} onChange={event => { version.current++; setName(event.target.value); setError(""); }} className="w-full rounded-xl border border-[#dce2d7] bg-[#fcfdf9] p-3 outline-none focus:border-[#668354] focus:ring-2 focus:ring-[#668354]/20 disabled:opacity-60" />
+            <button type="submit" className="primary" disabled={busy}>{busy ? "მოწმდება…" : "გაგრძელება"}</button>
+          </form>
+        ) : (
+          <div className="text-center">
+            {card.recipientName ? (
+              <p role="status" className="break-words rounded-2xl border border-[#d0dec5] bg-[#eef4e8] p-8 text-3xl font-bold text-[#284b38]">{card.recipientName}</p>
+            ) : (
+              <>
+                <div aria-hidden="true" className="relative mx-auto my-8 flex h-48 max-w-xs items-end justify-center rounded-b-[70px] border-b-[18px] border-[#b78a55] bg-[#f5eddc] pb-6">
+                  <span className="-rotate-12 rounded-xl bg-[#819b6c] px-5 py-9 text-3xl text-white shadow-md">✳</span><span className="-ml-5 mb-3 rotate-6 rounded-xl bg-[#284b38] px-5 py-9 text-3xl text-white shadow-md">✳</span><span className="-ml-5 rotate-12 rounded-xl bg-[#c49968] px-5 py-9 text-3xl text-white shadow-md">✳</span>
+                </div>
+                <button type="button" className="primary" disabled={busy} onClick={() => void submit("reveal")}>{busy ? "ბარათი იხსნება…" : "კალათიდან ამოღება"}</button>
+              </>
+            )}
+            <button type="button" onClick={hide} className="mt-5 w-full rounded-xl border border-[#c7d2c0] p-3 text-sm text-[#516453] hover:bg-[#f0f3ea] focus-visible:outline-2 focus-visible:outline-offset-2">შედეგის დამალვა</button>
+          </div>
+        )}
+        {error && <p role="alert" className="mt-5 rounded-xl bg-red-50 p-4 text-sm leading-7 text-red-800">{error}</p>}
+      </section>
+    </main>
   );
 }

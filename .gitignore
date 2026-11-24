@@ -39,3 +39,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+!.env.example
+/.data/
+
+# Private server-side Secret Santa state and atomic-write temporary files
+/data/

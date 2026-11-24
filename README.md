@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Secret Santa — ექვსი მეგობარი, ერთი კალათა
 
-## Getting Started
+ქართულენოვანი Next.js App Router აპი TypeScript-ით და Tailwind CSS-ით. მონაწილეებია **გიორგი, ნინი, მარი, ანა, რეზი, სოსო**. გამოიყენება მხოლოდ სახელები; რეგისტრაცია, ელფოსტა და წერილების გაგზავნა არ არის.
 
-First, run the development server:
+## გაშვება
 
-```bash
+საჭიროა Node.js 24+ და npm. ბაზა და გარემოს ცვლადები საჭირო არ არის.
+
+```sh
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+გახსენი http://localhost:3000. Production-ისთვის:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```sh
+npm run build
+npm start
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+აპის მისამართი გაუზიარე ექვსივე მეგობარს. შეიყვანე საკუთარი სახელი, დააჭირე „გაგრძელება“ და შემდეგ „კალათიდან ამოღება“. ბარათის გახსნის შემდეგ ღილაკის ნაცვლად გამოჩნდება მხოლოდ მიმღების სახელი. უკვე გახსნილი სახელის შეყვანა პირდაპირ შენახულ შედეგს აჩვენებს.
 
-## Learn More
+„შედეგის დამალვა“ მხოლოდ ეკრანზე შლის არჩევანს, რათა იმავე ტელეფონით შემდეგმა მეგობარმა ისარგებლოს. ფაილში შედეგს არ ცვლის. არჩეული სახელი მიმდინარე ჩანართის `sessionStorage`-ში ინახება; გვერდის განახლებაზე იგივე ბარათი აღდგება. თუ storage გამორთულია, სახელი ხელახლა აირჩიე. სხვა მოწყობილობიდან იმავე სახელის არჩევა იმავე შედეგს აჩვენებს. სახელის არჩევა იდენტობას არ ამოწმებს — ბმული თქვენს ჯგუფში გააზიარეთ.
 
-To learn more about Next.js, take a look at the following resources:
+## ფაილში შენახვა
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+აპი ავტომატურად ქმნის `data/secret-santa.json`-ს მხოლოდ სერვერზე, Node.js `fs/promises`-ით. ფაილი `public`-ში არ არის და `/data/` Git-ში იგნორირებულია. პროექტის საქაღალდეზე Node პროცესს უნდა ჰქონდეს წაკითხვისა და ჩაწერის უფლება.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+პირველ ვიზიტზე იქმნება ცარიელი რაუნდის ფაილი. **მხოლოდ პირველ ამოღებაზე** სერვერი Fisher–Yates-ით და `crypto.randomInt`-ით ქმნის ექვსივე წყვილს. საკუთარი თავის შეხვედრისას სია თავიდან ირევა. თითოეული მიმღები ზუსტად ერთხელ გამოიყენება. განაწილება და პირველი გახსნის დრო ერთად ინახება; სხვა ბარათების დრო მოგვიანებით ემატება. ხელახალი ამოღება ფაილს აღარ ცვლის.
 
-## Deploy on Vercel
+ერთი Node.js პროცესის ყველა service instance საერთო რიგს იყენებს ფაილის სრული მისამართით; წაკითხვაც და ცვლილებაც რიგრიგობით სრულდება. რიგი შეცდომის შემდეგაც მუშაობას აგრძელებს. ცვლილება ჯერ იმავე საქაღალდეში უნიკალურ დროებით ფაილში იწერება, სინქრონიზდება და `rename`-ით ცვლის მთავარ ფაილს. ამიტომ მკითხველი სრულ ძველ ან სრულ ახალ JSON-ს ხედავს. დროებითი ფაილები Git-შიც იგნორირებულია. დაზიანებული ფაილი შეცდომას აბრუნებს და ახალ განაწილებას ჩუმად არ ქმნის.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+სერვერის გადატვირთვა შენახულ ფაილს ხელახლა კითხულობს. გამოიყენე **ერთი Next.js პროცესი და მუდმივი ჩაწერადი დისკი**. რამდენიმე worker/instance, cluster, serverless ან დროებითი დისკი ამ შენახვის მოდელს არ შეესაბამება: რიგი მხოლოდ ერთი პროცესის შიგნით იცავს ცვლილებებს. ფაილი შეინარჩუნე განთავსებისას და სარეზერვო ასლებში. წაშლა ახალ რაუნდს შექმნის; აპში წაშლის/გადათამაშების ღილაკი არ არის.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+API მხოლოდ არჩეული მონაწილის გახსნილ ბარათს აბრუნებს. დახურულ ბარათზე მიმღები არ ბრუნდება; სრული განაწილება და ფაილი ბრაუზერს არ გადაეცემა და არ ლოგირდება. პასუხებს აქვს `private, no-store`. PostgreSQL-ის წინა მონაცემები JSON-ში ავტომატურად არ გადადის.
+
+## შემოწმება
+
+```sh
+npm test
+npm run lint
+npm run build
+```
+
+ტესტები იყენებს დროებით საქაღალდეებს და რეალურ ფაილურ ოპერაციებს: 10 000 განაწილება, ექვსივე ბარათი რამდენიმე რიგით, 60 ერთდროული ამოღება, განმეორებები, სახელების გადართვა, API პასუხების იზოლაცია, დაზიანებული ფაილი, ატომური ჩანაცვლებისას წაკითხვა და **ცალკე ახალ Node პროცესში** შენახული შედეგების აღდგენა. პროექტის რეალური რაუნდი ტესტებში არ იცვლება.
+
+საწყის ეკრანზე მხოლოდ სახელის ველი და „გაგრძელება“ ღილაკია. ჩამოსაშლელი სია და ავტომატური მინიშნებები არ გამოიყენება. ექვსივე სახელი `server-only` მოდულშია; სრული სია არც JavaScript bundle-ში და არც API პასუხებში არ გადაეცემა ბრაუზერს. არასწორ სახელზე ბრუნდება „სახელი ვერ მოიძებნა“; იმავე ველში შესაძლებელია ხელახლა შეყვანა.
